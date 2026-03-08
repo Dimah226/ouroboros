@@ -264,13 +264,18 @@ class OuroborosAgent:
                 spent = float(state_data.get("spent_usd", 0))
                 remaining = max(0, total_budget - spent)
 
-                if remaining < 10:
+                # Relative thresholds — scale with total_budget
+                emergency_threshold = max(total_budget * 0.10, 1.0)
+                critical_threshold = max(total_budget * 0.20, 2.0)
+                warning_threshold = max(total_budget * 0.30, 3.0)
+
+                if remaining < emergency_threshold:
                     status = "emergency"
                     issues = 1
-                elif remaining < 50:
+                elif remaining < critical_threshold:
                     status = "critical"
                     issues = 1
-                elif remaining < 100:
+                elif remaining < warning_threshold:
                     status = "warning"
                     issues = 0
                 else:
