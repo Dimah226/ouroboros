@@ -1,42 +1,52 @@
 #!/usr/bin/env python3
 """
-test_ollama.py — Zero-dependency script to test local Ollama installation.
+test_ollama.py — Vérifie que Ollama est installé et fonctionne localement.
 
 Usage:
     python scripts/test_ollama.py
     python scripts/test_ollama.py --model qwen3:8b
-    python scripts/test_ollama.py --host http://localhost:11434
+    python scripts/test_ollama.py --url http://localhost:11434
 
-No pip installs required. Uses only Python standard library.
+Dépendances: stdlib uniquement (aucun pip requis)
 """
 
-import json
 import sys
+import json
 import time
 import argparse
 import urllib.request
 import urllib.error
-from datetime import datetime
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ─── Configuration par défaut ────────────────────────────────────────────────
 
-DEFAULT_HOST  = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3:8b"
-TIMEOUT_S     = 30   # seconds to wait for a response
+DEFAULT_URL   = "http://localhost:11434"
+TIMEOUT_S     = 60  # secondes
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _get(url: str) -> dict | None:
-    """HTTP GET → parsed JSON, or None on error."""
+def separator(char="─", width=60):
+    print(char * width)
+
+def ok(msg):   print(f"  ✅  {msg}")
+def warn(msg): print(f"  ⚠️   {msg}")
+def err(msg):  print(f"  ❌  {msg}")
+def info(msg): print(f"  ℹ️   {msg}")
+
+
+def get_json(url: str) -> dict | None:
+    """GET JSON depuis une URL. Retourne None en cas d'erreur."""
     try:
         with urllib.request.urlopen(url, timeout=TIMEOUT_S) as r:
             return json.loads(r.read().decode())
-    except Exception:
+    except urllib.error.URLError:
+        return None
+    except json.JSONDecodeError:
         return None
 
 
-def _post(url: str, payload: dict) -> dict | None:
-    """HTTP POST JSON → parsed JSON, or None on error."""
+def post_json(url: str, payload: dict) -> dict | None:
+    """POST JSON et retourne la réponse parsée. Retourne None en cas d'erreur."""
     data = json.dumps(payload).encode()
     req  = urllib.request.Request(url, data=data,
                                   headers={"Content-Type": "application/json"})
@@ -44,155 +54,211 @@ def _post(url: str, payload: dict) -> dict | None:
         with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
             return json.loads(r.read().decode())
     except urllib.error.URLError as e:
-        print(f"  ✗ Connection error: {e.reason}")
-        return None
-    except json.JSONDecodeError:
-        print("  ✗ Server returned invalid JSON.")
-        return None
+        raise ConnectionError(str(e)) from e
+    except json.JSONDecodeError as e:
+        raise ValueError("Réponse JSON invalide") from e
 
 
-def _ok(msg: str):  print(f"  ✓ {msg}")
-def _fail(msg: str): print(f"  ✗ {msg}")
-def _info(msg: str): print(f"  · {msg}")
+# ─── Étapes de test ──────────────────────────────────────────────────────────
 
-# ── Test steps ─────────────────────────────────────────────────────────────────
+def step_ping(base_url: str) -> bool:
+    """Étape 1 : Ollama répond-il sur le port 11434 ?"""
+    separator()
+    print("Étape 1 — Connexion au serveur Ollama")
+    separator()
 
-def test_reachable(host: str) -> bool:
-    """Check that Ollama is listening at all."""
-    print("\n[1/4] Connectivity check …")
-    result = _get(f"{host}/api/version")
-    if result and "version" in result:
-        _ok(f"Ollama v{result['version']} is running at {host}")
-        return True
-    _fail(f"Cannot reach {host}")
+    data = get_json(f"{base_url}/api/tags")
+    if data is None:
+        err("Impossible de contacter Ollama.")
+        print()
+        warn("Causes possibles :")
+        info("  → Ollama n'est pas démarré  : lancez 'ollama serve' dans un terminal")
+        info("  → Pare-feu Windows bloque le port 11434")
+        info("  → URL incorrecte (défaut : http://localhost:11434)")
+        return False
+
+    ok(f"Serveur Ollama joignable → {base_url}")
+    return True
+
+
+def step_list_models(base_url: str) -> list[str]:
+    """Étape 2 : Quels modèles sont disponibles ?"""
+    separator()
+    print("Étape 2 — Modèles disponibles localement")
+    separator()
+
+    data = get_json(f"{base_url}/api/tags") or {}
+    models = [m["name"] for m in data.get("models", [])]
+
+    if not models:
+        warn("Aucun modèle installé.")
+        info("  → Installez un modèle avec : ollama pull qwen3:8b")
+    else:
+        ok(f"{len(models)} modèle(s) trouvé(s) :")
+        for m in models:
+            print(f"       • {m}")
+    return models
+
+
+def step_inference(base_url: str, model: str) -> bool:
+    """Étape 3 : Test d'inférence avec le modèle choisi."""
+    separator()
+    print(f"Étape 3 — Test d'inférence  (modèle : {model})")
+    separator()
+
+    prompt = (
+        "Réponds en une seule phrase courte en français : "
+        "quel est le résultat de 12 × 8 ?"
+    )
+    info(f"Prompt : {prompt}")
     print()
-    print("  → Is Ollama installed?  https://ollama.com/download/windows")
-    print("  → Is it running?        Check the system tray icon, or run:")
-    print("                            ollama serve")
+
+    try:
+        t0 = time.perf_counter()
+        resp = post_json(f"{base_url}/api/generate", {
+            "model":  model,
+            "prompt": prompt,
+            "stream": False,
+        })
+        elapsed = time.perf_counter() - t0
+    except ConnectionError as e:
+        err(f"Erreur de connexion pendant l'inférence : {e}")
+        return False
+    except ValueError as e:
+        err(f"Réponse invalide : {e}")
+        return False
+
+    if resp is None or "response" not in resp:
+        err("Réponse vide ou format inattendu.")
+        info(f"Réponse brute : {resp}")
+        return False
+
+    text = resp["response"].strip()
+    tokens  = resp.get("eval_count", 0)
+    t_load  = resp.get("load_duration",  0) / 1e9   # ns → s
+    t_total = resp.get("total_duration", 0) / 1e9
+
+    ok(f"Réponse reçue en {elapsed:.2f}s")
+    print()
+    print(f'  📝  "{text}"')
+    print()
+
+    if tokens and elapsed > 0:
+        tps = tokens / elapsed
+        info(f"Tokens générés : {tokens}  |  Débit : {tps:.1f} t/s")
+    if t_load > 0:
+        info(f"Chargement modèle : {t_load:.1f}s  |  Total Ollama : {t_total:.1f}s")
+
+    return True
+
+
+def step_api_compat(base_url: str, model: str) -> bool:
+    """Étape 4 : Test compatibilité API OpenAI (/v1/chat/completions)."""
+    separator()
+    print("Étape 4 — Compatibilité API OpenAI (optionnel)")
+    separator()
+
+    try:
+        resp = post_json(f"{base_url}/v1/chat/completions", {
+            "model": model,
+            "messages": [{"role": "user", "content": "Dis juste : OK"}],
+        })
+    except (ConnectionError, ValueError):
+        warn("Endpoint /v1/chat/completions non disponible.")
+        info("  → Normal sur certaines versions d'Ollama antérieures à 0.2")
+        return False
+
+    if resp and resp.get("choices"):
+        msg = resp["choices"][0].get("message", {}).get("content", "").strip()
+        ok(f"API OpenAI compatible  →  réponse : \"{msg}\"")
+        info("  → Ouroboros pourra utiliser ce endpoint directement")
+        return True
+
+    warn("Réponse /v1 inattendue — compatibilité partielle.")
     return False
 
 
-def list_models(host: str) -> list[str]:
-    """Return a list of locally available model names."""
-    print("\n[2/4] Available models …")
-    result = _get(f"{host}/api/tags")
-    if not result or "models" not in result:
-        _fail("Could not retrieve model list.")
-        return []
-
-    models = result["models"]
-    if not models:
-        _fail("No models installed yet.")
-        print("  → Pull one with:  ollama pull qwen3:8b")
-        return []
-
-    names = [m["name"] for m in models]
-    for m in models:
-        size_gb = m.get("size", 0) / 1e9
-        _ok(f"{m['name']}  ({size_gb:.1f} GB)")
-    return names
-
-
-def test_generation(host: str, model: str) -> bool:
-    """Send a short prompt and measure response time + tokens/sec."""
-    print(f"\n[3/4] Generation test  (model: {model}) …")
-    _info("Sending prompt — this may take a few seconds on first run …")
-
-    prompt  = "Réponds en une phrase courte : quelle est la capitale de la France ?"
-    t0      = time.perf_counter()
-    result  = _post(f"{host}/api/generate",
-                    {"model": model, "prompt": prompt, "stream": False})
-    elapsed = time.perf_counter() - t0
-
-    if not result:
-        _fail("No response from model.")
-        print(f"  → Is the model installed?  ollama pull {model}")
-        return False
-
-    response_text = result.get("response", "").strip()
-    eval_count    = result.get("eval_count", 0)          # tokens generated
-    eval_ns       = result.get("eval_duration", 0)       # nanoseconds
-
-    tps = eval_count / (eval_ns / 1e9) if eval_ns else 0
-
-    _ok(f"Response received in {elapsed:.1f}s")
-    _info(f"Tokens generated : {eval_count}")
-    _info(f"Speed            : {tps:.1f} tokens/sec")
-    print()
-    print(f"  Prompt   : {prompt}")
-    print(f"  Response : {response_text}")
-    return True
-
-
-def test_api_endpoint(host: str, model: str) -> bool:
-    """Test the /api/chat endpoint (OpenAI-compatible style)."""
-    print(f"\n[4/4] Chat endpoint test …")
-    result = _post(f"{host}/api/chat", {
-        "model": model,
-        "messages": [{"role": "user", "content": "Say 'OK' and nothing else."}],
-        "stream": False,
-    })
-
-    if not result:
-        _fail("/api/chat endpoint failed.")
-        return False
-
-    content = result.get("message", {}).get("content", "").strip()
-    _ok(f"/api/chat works  →  model replied: '{content}'")
-    return True
-
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ─── Point d'entrée ──────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Test local Ollama installation.")
-    parser.add_argument("--host",  default=DEFAULT_HOST,  help="Ollama base URL")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model to test")
+    parser = argparse.ArgumentParser(
+        description="Teste une installation Ollama locale."
+    )
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help=f"Modèle à tester (défaut : {DEFAULT_MODEL})")
+    parser.add_argument("--url",   default=DEFAULT_URL,
+                        help=f"URL du serveur Ollama (défaut : {DEFAULT_URL})")
     args = parser.parse_args()
 
-    host  = args.host.rstrip("/")
-    model = args.model
+    base_url = args.url.rstrip("/")
+    model    = args.model
 
-    print("=" * 60)
-    print(f"  Ollama connectivity test — {datetime.now():%Y-%m-%d %H:%M:%S}")
-    print(f"  Host  : {host}")
-    print(f"  Model : {model}")
-    print("=" * 60)
+    separator("═")
+    print("  🔍  Test Ollama — vérification de l'installation locale")
+    separator("═")
+    print(f"  URL    : {base_url}")
+    print(f"  Modèle : {model}")
+    separator("═")
+    print()
 
-    # ── Step 1: reachable?
-    if not test_reachable(host):
+    # Étape 1 — ping
+    if not step_ping(base_url):
+        separator("═")
+        err("Test interrompu : serveur inaccessible.")
+        separator("═")
         sys.exit(1)
 
-    # ── Step 2: model list
-    available = list_models(host)
+    # Étape 2 — liste modèles
+    available = step_list_models(base_url)
 
-    # ── Step 3 & 4: generation + chat (only if model present)
-    model_present = any(model in n for n in available)
-    if not model_present and available:
-        fallback = available[0]
-        print(f"\n  ⚠ Model '{model}' not found locally. Falling back to '{fallback}'.")
-        model = fallback
-    elif not model_present:
-        print(f"\n  ⚠ No models available. Pull one first:")
-        print(f"      ollama pull {DEFAULT_MODEL}")
-        sys.exit(1)
+    # Vérifier que le modèle demandé est présent
+    if model not in available:
+        # Cherche une correspondance partielle (ex. "qwen3" dans "qwen3:8b")
+        matches = [m for m in available if model.split(":")[0] in m]
+        if matches:
+            model = matches[0]
+            warn(f"Modèle exact non trouvé — utilisation de : {model}")
+        else:
+            separator()
+            err(f"Modèle '{model}' non disponible localement.")
+            info(f"  → Pour l'installer : ollama pull {model}")
+            if available:
+                info(f"  → Modèles disponibles : {', '.join(available)}")
+            separator("═")
+            err("Test interrompu : modèle manquant.")
+            separator("═")
+            sys.exit(1)
 
-    gen_ok  = test_generation(host, model)
-    chat_ok = test_api_endpoint(host, model)
+    # Étape 3 — inférence
+    inference_ok = step_inference(base_url, model)
 
-    # ── Summary
-    print("\n" + "=" * 60)
-    all_ok = gen_ok and chat_ok
-    if all_ok:
-        print("  🎉 ALL TESTS PASSED — Ollama is ready!")
+    # Étape 4 — compat OpenAI (non bloquant)
+    compat_ok = False
+    if inference_ok:
+        compat_ok = step_api_compat(base_url, model)
+
+    # ─── Résumé ─────────────────────────────────────────────────────────────
+    separator("═")
+    print("  📋  Résumé")
+    separator("═")
+    ok("Serveur Ollama : en ligne")
+    (ok if inference_ok else err)(f"Inférence ({model}) : {'OK' if inference_ok else 'ÉCHEC'}")
+    (ok if compat_ok  else warn)(f"API OpenAI compat   : {'OK' if compat_ok else 'non disponible'}")
+    separator("═")
+
+    if inference_ok:
         print()
-        print("  To use it as an API endpoint from Ouroboros:")
-        print(f"    Base URL : {host}/v1")
-        print(f"    Model    : {model}")
-        print("    (No API key required for local Ollama)")
+        ok("Ollama est opérationnel sur ta machine.")
+        print()
+        info("Prochaine étape — connecter Ouroboros à ce modèle local :")
+        info("  Configurer OPENROUTER_BASE_URL=http://localhost:11434/v1")
+        info("  et OUROBOROS_MODEL=qwen3:8b dans l'environnement Colab")
+        print()
     else:
-        print("  ⚠  Some tests failed — see details above.")
-    print("=" * 60)
-    sys.exit(0 if all_ok else 1)
+        print()
+        err("Ollama ne répond pas correctement. Consulte les messages ci-dessus.")
+        print()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
