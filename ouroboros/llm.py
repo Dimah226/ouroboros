@@ -4,10 +4,9 @@ Ouroboros — LLM client.
 The only module that communicates with the LLM API (OpenRouter).
 Contract: chat(), default_model(), available_models(), add_usage().
 
-Local LLM support:
-  Set LOCAL_LLM_URL=https://your-tunnel.trycloudflare.com/v1 in env.
-  Use model prefix "local/" (e.g. "local/qwen3:8b") to route to local endpoint.
-  Ollama-incompatible fields (reasoning, provider) are stripped automatically.
+Local LLM routing: if LOCAL_LLM_URL env var is set, models prefixed with
+"local/" are routed to that endpoint (Ollama via Cloudflare tunnel).
+Example: model="local/qwen3:8b" -> calls LOCAL_LLM_URL/v1/chat/completions
 """
 
 from __future__ import annotations
@@ -110,8 +109,10 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
 class LLMClient:
     """OpenRouter API wrapper with optional local LLM routing.
 
-    Local routing: set LOCAL_LLM_URL env var and use model prefix "local/"
-    e.g. model="local/qwen3:8b" routes to LOCAL_LLM_URL without OpenRouter headers.
+    If LOCAL_LLM_URL env var is set (e.g. https://xxx.trycloudflare.com),
+    models prefixed with "local/" are routed to that endpoint instead of
+    OpenRouter. OpenRouter-specific fields (reasoning, provider, cache_control)
+    are stripped for local calls.
     """
 
     def __init__(
@@ -122,28 +123,12 @@ class LLMClient:
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._base_url = base_url
         self._client = None
+
         # Local LLM support (Ollama via Cloudflare tunnel or direct)
         self._local_llm_url = os.environ.get("LOCAL_LLM_URL", "").rstrip("/")
         self._local_client = None
 
-    def _get_client(self, base_url: Optional[str] = None):
-        """Return the appropriate OpenAI client for the given base_url.
-
-        If base_url matches LOCAL_LLM_URL, returns a lightweight local client
-        (no OpenRouter headers, dummy API key).
-        Otherwise returns the standard OpenRouter client.
-        """
-        # Local client path
-        if base_url and self._local_llm_url and base_url == self._local_llm_url:
-            if self._local_client is None:
-                from openai import OpenAI
-                self._local_client = OpenAI(
-                    base_url=self._local_llm_url,
-                    api_key="local",  # Ollama ignores this but OpenAI client requires it
-                )
-            return self._local_client
-
-        # Standard OpenRouter client
+    def _get_client(self):
         if self._client is None:
             from openai import OpenAI
             self._client = OpenAI(
@@ -155,6 +140,68 @@ class LLMClient:
                 },
             )
         return self._client
+
+    def _get_local_client(self):
+        """Return OpenAI-compatible client pointing at the local LLM endpoint."""
+        if self._local_client is None:
+            from openai import OpenAI
+            # Ollama exposes OpenAI-compatible API at /v1
+            local_base = f"{self._local_llm_url}/v1"
+            self._local_client = OpenAI(
+                base_url=local_base,
+                api_key="ollama",  # Ollama ignores the key but the client requires a non-empty string
+            )
+            log.info("Local LLM client initialized: %s", local_base)
+        return self._local_client
+
+    def _is_local_model(self, model: str) -> bool:
+        """Return True if this model should be routed to the local LLM endpoint."""
+        if not self._local_llm_url:
+            return False
+        return model.startswith("local/")
+
+    def _chat_local(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        max_tokens: int,
+        tool_choice: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Send a chat request to the local LLM (Ollama via Cloudflare tunnel).
+
+        Strips all OpenRouter-specific fields (reasoning, provider, cache_control).
+        Local models are free — cost is reported as 0.0.
+        """
+        # Strip the "local/" prefix to get the actual Ollama model name
+        local_model = model.removeprefix("local/")
+        client = self._get_local_client()
+
+        kwargs: Dict[str, Any] = {
+            "model": local_model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            # Strip cache_control metadata — Ollama doesn't support it
+            clean_tools = []
+            for t in tools:
+                t_copy = {k: v for k, v in t.items() if k != "cache_control"}
+                clean_tools.append(t_copy)
+            kwargs["tools"] = clean_tools
+            kwargs["tool_choice"] = tool_choice
+
+        log.debug("local LLM call: model=%s url=%s", local_model, self._local_llm_url)
+        resp = client.chat.completions.create(**kwargs)
+        resp_dict = resp.model_dump()
+        usage = resp_dict.get("usage") or {}
+        choices = resp_dict.get("choices") or [{}]
+        msg = (choices[0] if choices else {}).get("message") or {}
+
+        # Local models are free
+        usage["cost"] = 0.0
+        log.debug("local LLM response: tokens=%s", usage.get("total_tokens"))
+        return msg, usage
 
     def _fetch_generation_cost(self, generation_id: str) -> Optional[float]:
         """Fetch cost from OpenRouter Generation API as fallback."""
@@ -191,45 +238,15 @@ class LLMClient:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Single LLM call. Returns: (response_message_dict, usage_dict with cost).
 
-        Local routing: if model starts with "local/", routes to LOCAL_LLM_URL.
-        OpenRouter-specific fields (reasoning, provider, cache_control) are stripped
-        for local calls to ensure compatibility with Ollama/LocalAI.
+        Routes "local/*" models to LOCAL_LLM_URL if configured.
+        All other models go through OpenRouter.
         """
         effort = normalize_reasoning_effort(reasoning_effort)
 
-        # ── Local LLM routing (Ollama / LocalAI via tunnel) ───────────────────
-        if model.startswith("local/"):
-            if not self._local_llm_url:
-                raise ValueError(
-                    "Model prefix 'local/' requires LOCAL_LLM_URL env var to be set. "
-                    "Example: LOCAL_LLM_URL=https://your-tunnel.trycloudflare.com/v1"
-                )
-            # Strip prefix to get the actual Ollama model name
-            actual_model = model[len("local/"):]
-            log.debug("Local LLM routing: %s → %s at %s", model, actual_model, self._local_llm_url)
+        # Route local/ models to the local LLM endpoint (Ollama)
+        if self._is_local_model(model):
+            return self._chat_local(model, messages, tools, max_tokens, tool_choice)
 
-            local_client = self._get_client(base_url=self._local_llm_url)
-            local_kwargs: Dict[str, Any] = {
-                "model": actual_model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-            }
-            if tools:
-                # Pass tools as-is (no cache_control injection for local)
-                local_kwargs["tools"] = tools
-                local_kwargs["tool_choice"] = tool_choice
-
-            resp = local_client.chat.completions.create(**local_kwargs)
-            resp_dict = resp.model_dump()
-            usage = resp_dict.get("usage") or {}
-            choices = resp_dict.get("choices") or [{}]
-            msg = (choices[0] if choices else {}).get("message") or {}
-            # Local models have no billing cost
-            usage.setdefault("cost", 0.0)
-            return msg, usage
-        # ── End local routing ──────────────────────────────────────────────────
-
-        # Standard OpenRouter path
         client = self._get_client()
 
         extra_body: Dict[str, Any] = {
