@@ -3,6 +3,11 @@ Ouroboros — LLM client.
 
 The only module that communicates with the LLM API (OpenRouter).
 Contract: chat(), default_model(), available_models(), add_usage().
+
+Local LLM support:
+  Set LOCAL_LLM_URL=https://your-tunnel.trycloudflare.com/v1 in env.
+  Use model prefix "local/" (e.g. "local/qwen3:8b") to route to local endpoint.
+  Ollama-incompatible fields (reasoning, provider) are stripped automatically.
 """
 
 from __future__ import annotations
@@ -103,7 +108,11 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
 
 
 class LLMClient:
-    """OpenRouter API wrapper. All LLM calls go through this class."""
+    """OpenRouter API wrapper with optional local LLM routing.
+
+    Local routing: set LOCAL_LLM_URL env var and use model prefix "local/"
+    e.g. model="local/qwen3:8b" routes to LOCAL_LLM_URL without OpenRouter headers.
+    """
 
     def __init__(
         self,
@@ -113,8 +122,28 @@ class LLMClient:
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._base_url = base_url
         self._client = None
+        # Local LLM support (Ollama via Cloudflare tunnel or direct)
+        self._local_llm_url = os.environ.get("LOCAL_LLM_URL", "").rstrip("/")
+        self._local_client = None
 
-    def _get_client(self):
+    def _get_client(self, base_url: Optional[str] = None):
+        """Return the appropriate OpenAI client for the given base_url.
+
+        If base_url matches LOCAL_LLM_URL, returns a lightweight local client
+        (no OpenRouter headers, dummy API key).
+        Otherwise returns the standard OpenRouter client.
+        """
+        # Local client path
+        if base_url and self._local_llm_url and base_url == self._local_llm_url:
+            if self._local_client is None:
+                from openai import OpenAI
+                self._local_client = OpenAI(
+                    base_url=self._local_llm_url,
+                    api_key="local",  # Ollama ignores this but OpenAI client requires it
+                )
+            return self._local_client
+
+        # Standard OpenRouter client
         if self._client is None:
             from openai import OpenAI
             self._client = OpenAI(
@@ -160,9 +189,48 @@ class LLMClient:
         max_tokens: int = 16384,
         tool_choice: str = "auto",
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Single LLM call. Returns: (response_message_dict, usage_dict with cost)."""
-        client = self._get_client()
+        """Single LLM call. Returns: (response_message_dict, usage_dict with cost).
+
+        Local routing: if model starts with "local/", routes to LOCAL_LLM_URL.
+        OpenRouter-specific fields (reasoning, provider, cache_control) are stripped
+        for local calls to ensure compatibility with Ollama/LocalAI.
+        """
         effort = normalize_reasoning_effort(reasoning_effort)
+
+        # ── Local LLM routing (Ollama / LocalAI via tunnel) ───────────────────
+        if model.startswith("local/"):
+            if not self._local_llm_url:
+                raise ValueError(
+                    "Model prefix 'local/' requires LOCAL_LLM_URL env var to be set. "
+                    "Example: LOCAL_LLM_URL=https://your-tunnel.trycloudflare.com/v1"
+                )
+            # Strip prefix to get the actual Ollama model name
+            actual_model = model[len("local/"):]
+            log.debug("Local LLM routing: %s → %s at %s", model, actual_model, self._local_llm_url)
+
+            local_client = self._get_client(base_url=self._local_llm_url)
+            local_kwargs: Dict[str, Any] = {
+                "model": actual_model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+            }
+            if tools:
+                # Pass tools as-is (no cache_control injection for local)
+                local_kwargs["tools"] = tools
+                local_kwargs["tool_choice"] = tool_choice
+
+            resp = local_client.chat.completions.create(**local_kwargs)
+            resp_dict = resp.model_dump()
+            usage = resp_dict.get("usage") or {}
+            choices = resp_dict.get("choices") or [{}]
+            msg = (choices[0] if choices else {}).get("message") or {}
+            # Local models have no billing cost
+            usage.setdefault("cost", 0.0)
+            return msg, usage
+        # ── End local routing ──────────────────────────────────────────────────
+
+        # Standard OpenRouter path
+        client = self._get_client()
 
         extra_body: Dict[str, Any] = {
             "reasoning": {"effort": effort, "exclude": True},
