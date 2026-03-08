@@ -243,13 +243,19 @@ def init_state() -> Dict[str, Any]:
 # Budget tracking (moved from workers.py)
 # ---------------------------------------------------------------------------
 TOTAL_BUDGET_LIMIT: float = 0.0
-EVOLUTION_BUDGET_RESERVE: float = 50.0  # Stop evolution when remaining < this
+EVOLUTION_BUDGET_RESERVE: float = 2.0  # Stop evolution when remaining < this (auto-scaled)
+
+# Reserve fraction of total budget for conversations (clamped to [$1.0, $5.0])
+_EVOLUTION_RESERVE_FRACTION: float = 0.20
 
 
 def set_budget_limit(limit: float) -> None:
-    """Set total budget limit for budget_pct calculation."""
-    global TOTAL_BUDGET_LIMIT
+    """Set total budget limit and auto-scale the evolution reserve."""
+    global TOTAL_BUDGET_LIMIT, EVOLUTION_BUDGET_RESERVE
     TOTAL_BUDGET_LIMIT = limit
+    if limit > 0:
+        # Reserve 20% of total budget for conversations, clamped to [$1.0, $5.0]
+        EVOLUTION_BUDGET_RESERVE = max(1.0, min(5.0, limit * _EVOLUTION_RESERVE_FRACTION))
 
 
 def budget_remaining(st: Dict[str, Any]) -> float:
